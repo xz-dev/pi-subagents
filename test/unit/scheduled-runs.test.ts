@@ -1,525 +1,286 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { after, before, describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
-	SCHEDULED_RUNS_DIR,
-	ScheduledRunManager,
+	SCHEDULED_RUN_ACTIONS,
 	createScheduledRunManager,
 	isScheduledRunAction,
+	listScheduledRunSummaries,
+	parseScheduleInterval,
 	parseScheduledRunTime,
 	scheduledRunStorePath,
 	scheduledRunsEnabled,
+	type ScheduledRunManager,
 } from "../../src/runs/background/scheduled-runs.ts";
 import type { ExtensionConfig } from "../../src/shared/types.ts";
-import { encodeSubagentCapabilityCeiling, resolveCurrentSubagentCapabilityCeiling } from "../../src/api/capability-ceiling.ts";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-type TimerHandle = number;
-
+type Timer = { callback: () => void; delay: number };
 class FakeTimers {
-	readonly scheduled = new Map<TimerHandle, { cb: () => void; delay: number }>();
-	private nextHandle = 1;
-
-	setTimeout = (cb: () => void, delay: number): TimerHandle => {
-		const handle = this.nextHandle++;
-		this.scheduled.set(handle, { cb, delay });
-		return handle;
+	readonly values = new Map<number, Timer>();
+	private id = 0;
+	setTimeout = (callback: () => void, delay: number) => {
+		const id = ++this.id;
+		this.values.set(id, { callback, delay });
+		return id as unknown as ReturnType<typeof setTimeout>;
 	};
-
-	clearTimeout = (handle: TimerHandle): void => {
-		this.scheduled.delete(handle);
-	};
-
+	clearTimeout = (id: ReturnType<typeof setTimeout>) => void this.values.delete(id as unknown as number);
 	fireAll(): void {
-		// Snapshot first: fire() re-arms by clearing the fired handle and adding a new one.
-		const entries = [...this.scheduled.values()];
-		for (const entry of entries) entry.cb();
-	}
-
-	pendingCount(): number {
-		return this.scheduled.size;
+		const pending = [...this.values.entries()];
+		for (const [id, timer] of pending) {
+			this.values.delete(id);
+			timer.callback();
+		}
 	}
 }
 
-type LaunchRecord = {
+type Launch = {
 	params: Record<string, unknown>;
-	ctx: ExtensionContext;
-	signal: AbortSignal;
-	resolve: (result: { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown>; isError?: boolean }) => void;
-	promise: Promise<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown>; isError?: boolean }>;
+	resolve(result: { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown>; isError?: boolean }): void;
 };
 
-type TestHarness = {
+type Harness = {
 	manager: ScheduledRunManager;
-	timers: FakeTimers;
-	launches: LaunchRecord[];
-	clock: { now: number };
-	storeRoot: string;
 	ctx: ExtensionContext;
+	clock: { now: number };
+	timers: FakeTimers;
+	launches: Launch[];
+	root: string;
 };
 
-function makeCtx(cwd = "/project", sessionFile = "/sessions/abc.jsonl"): ExtensionContext {
+const roots: string[] = [];
+afterEach(() => {
+	for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+function context(cwd: string, sessionId = "session-a"): ExtensionContext {
 	return {
 		cwd,
 		sessionManager: {
-			getSessionFile: () => sessionFile,
-			getSessionId: () => path.basename(sessionFile, ".jsonl"),
+			getSessionId: () => sessionId,
+			getSessionFile: () => path.join(cwd, `${sessionId}.jsonl`),
 		},
 	} as unknown as ExtensionContext;
 }
 
-function makeConfig(overrides: Partial<ExtensionConfig["scheduledRuns"]> = {}): ExtensionConfig {
-	return { scheduledRuns: { enabled: true, ...overrides } };
-}
-
-async function flushMicrotasks(times = 10): Promise<void> {
-	for (let i = 0; i < times; i++) await Promise.resolve();
-}
-
-function createHarness(options: { config?: ExtensionConfig; storeRoot?: string; now?: number; resolveCapabilityCeiling?: (sessionId: string) => { version: 1; allowedTools?: string[]; denyExtensions: boolean; sources: string[] } | undefined } = {}): TestHarness {
+function harness(options: { cwd?: string; sessionId?: string; now?: number; config?: ExtensionConfig } = {}): Harness {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-schedule-test-"));
+	roots.push(root);
+	const project = options.cwd ?? path.join(root, "project");
+	fs.mkdirSync(project, { recursive: true });
+	const ctx = context(project, options.sessionId);
+	const clock = { now: options.now ?? Date.parse("2030-01-01T00:00:00Z") };
 	const timers = new FakeTimers();
-	const launches: LaunchRecord[] = [];
-	const clock = { now: options.now ?? 1_000_000 };
-	const storeRoot = options.storeRoot ?? fs.mkdtempSync(path.join(os.tmpdir(), "sched-test-"));
+	const launches: Launch[] = [];
+	let id = 0;
 	const manager = createScheduledRunManager({
-		config: options.config ?? makeConfig(),
-		storeRoot,
+		config: options.config ?? { scheduledRuns: { enabled: true } },
+		storeRoot: path.join(root, "stores"),
 		now: () => clock.now,
-		randomId: () => "id-" + randomUUID().slice(0, 4),
+		randomId: () => `id-${++id}`,
 		timers,
-		resolveCapabilityCeiling: options.resolveCapabilityCeiling,
-		launch: (params, ctx, signal) => {
-			let resolve!: LaunchRecord["resolve"];
-			const promise = new Promise<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown>; isError?: boolean }>((res) => {
-				resolve = res;
-			});
-			launches.push({ params: params as unknown as Record<string, unknown>, ctx, signal, resolve, promise });
-			return promise as ReturnType<TestHarness["manager"]["handleToolCall"]>;
-		},
+		launch: (params) => new Promise((resolve) => launches.push({ params: params as Record<string, unknown>, resolve: resolve as Launch["resolve"] })) as never,
 	});
-	const ctx = makeCtx();
-	return { manager, timers, launches, clock, storeRoot, ctx };
+	manager.bindSession(ctx);
+	return { manager, ctx, clock, timers, launches, root };
 }
 
-function extractId(result: { content: Array<{ type: "text"; text: string }> }): string {
-	const text = result.content[0]!.text;
-	const match = text.match(/Scheduled subagent run (id-[a-z0-9]+)/);
-	assert.ok(match, `expected scheduled run id in: ${text}`);
-	return match[1]!;
+function text(result: Awaited<ReturnType<ScheduledRunManager["handleToolCall"]>>): string {
+	return result.content[0]?.type === "text" ? result.content[0].text : "";
 }
 
-function isError(result: { isError?: boolean }): boolean {
-	return result.isError === true;
+async function flush(): Promise<void> {
+	for (let i = 0; i < 8; i++) await Promise.resolve();
 }
 
-describe("scheduled-runs helpers", () => {
-	it("isScheduledRunAction narrows the four actions", () => {
-		assert.equal(isScheduledRunAction("schedule"), true);
-		assert.equal(isScheduledRunAction("schedule-cancel"), true);
-		assert.equal(isScheduledRunAction("status"), false);
-		assert.equal(isScheduledRunAction(undefined), false);
+describe("schedule helpers", () => {
+	it("recognizes only the dot-action schedule API", () => {
+		assert.deepEqual(SCHEDULED_RUN_ACTIONS, ["schedule.create", "schedule.list", "schedule.show", "schedule.history", "schedule.pause", "schedule.resume", "schedule.run", "schedule.run-due", "schedule.delete"]);
+		assert.equal(isScheduledRunAction("schedule.create"), true);
+		assert.equal(isScheduledRunAction("schedule"), false);
 	});
 
-	it("scheduledRunsEnabled defaults to enabled and honors an explicit opt-out", () => {
+	it("uses a stable project store independent of session id", () => {
+		const root = path.join("tmp", "schedules");
+		assert.equal(scheduledRunStorePath("project", "a", root), scheduledRunStorePath("project", "b", root));
+		assert.notEqual(scheduledRunStorePath("project", "a", root), scheduledRunStorePath("other", "a", root));
+		assert.equal(scheduledRunStorePath("/project"), path.join("/project", ".pi-subagents", "schedules"));
+	});
+
+	it("parses one-shot and fixed interval forms strictly", () => {
+		const now = Date.parse("2030-01-01T00:00:00Z");
+		assert.equal(parseScheduledRunTime("+10m", now), now + 600_000);
+		assert.equal(parseScheduledRunTime("2030-01-02T00:00:00Z", now), now + 86_400_000);
+		assert.equal(parseScheduledRunTime("2030-01-02T09:00:00+05:30", now), Date.parse("2030-01-02T09:00:00+05:30"));
+		assert.equal(parseScheduleInterval("30m"), 1_800_000);
+		assert.equal(parseScheduleInterval("2w"), 1_209_600_000);
+		assert.throws(() => parseScheduleInterval("day"), /fixed intervals/);
+		assert.throws(() => parseScheduledRunTime("2030-01-01T00:00:00", now), /timezone/);
+	});
+
+	it("honors the explicit feature opt-out", () => {
 		assert.equal(scheduledRunsEnabled({}), true);
-		assert.equal(scheduledRunsEnabled({ scheduledRuns: {} }), true);
 		assert.equal(scheduledRunsEnabled({ scheduledRuns: { enabled: false } }), false);
-		assert.equal(scheduledRunsEnabled({ scheduledRuns: { enabled: true } }), true);
-	});
-
-	it("scheduledRunStorePath is stable per cwd+session and distinct otherwise", () => {
-		const root = path.join("tmp", "sched-root");
-		const project = path.join("project");
-		const other = path.join("other");
-		const a = scheduledRunStorePath(project, "sess1", root);
-		const aAgain = scheduledRunStorePath(project, "sess1", root);
-		const b = scheduledRunStorePath(project, "sess2", root);
-		const c = scheduledRunStorePath(other, "sess1", root);
-		assert.equal(a, aAgain);
-		assert.notEqual(a, b);
-		assert.notEqual(a, c);
-		assert.ok(a.startsWith(root));
-		assert.ok(a.endsWith(".json"));
-	});
-
-	it("parseScheduledRunTime handles relative delays and ISO timestamps", () => {
-		const base = 1_000_000;
-		assert.equal(parseScheduledRunTime("+10m", base), base + 10 * 60_000);
-		assert.equal(parseScheduledRunTime("+1h", base), base + 3_600_000);
-		assert.equal(parseScheduledRunTime("+2d", base), base + 2 * 86_400_000);
-		assert.equal(parseScheduledRunTime("+30s", base), base + 30_000);
-		assert.equal(parseScheduledRunTime("2030-01-01T00:00:00Z", base), new Date("2030-01-01T00:00:00Z").getTime());
-		assert.equal(parseScheduledRunTime("2030-01-01T09:00:00+05:30", base), new Date("2030-01-01T09:00:00+05:30").getTime());
-	});
-
-	it("parseScheduledRunTime rejects past, zero, malformed, and ambiguous schedules", () => {
-		assert.throws(() => parseScheduledRunTime("+0m", 1_000_000), /positive/);
-		assert.throws(() => parseScheduledRunTime("+9000000000000d", 1_000_000), /too large/);
-		assert.throws(() => parseScheduledRunTime("2020-01-01T00:00:00Z", Date.now() + 60_000), /in the past/);
-		assert.throws(() => parseScheduledRunTime("2030-01-01T00:00:00", 1_000_000), /must include a timezone/);
-		assert.throws(() => parseScheduledRunTime("2030-02-30T00:00:00Z", 1_000_000), /valid future ISO/);
-		assert.throws(() => parseScheduledRunTime("next tuesday", 1_000_000), /Invalid schedule/);
-		assert.throws(() => parseScheduledRunTime("+5w", 1_000_000), /Invalid schedule/);
 	});
 });
 
-describe("ScheduledRunManager create/list/status/cancel", () => {
-	let storeRoots: string[] = [];
-	after(() => {
-		for (const root of storeRoots) {
-			try {
-				fs.rmSync(root, { recursive: true, force: true });
-			} catch {
-				// best-effort cleanup of temp test dirs
-			}
+describe("project schedule management", () => {
+	it("creates a project one-shot schedule and restores it in another session", async () => {
+		const first = harness();
+		const result = await first.manager.handleToolCall({ action: "schedule.create", id: "night-review", name: "Night review", at: "+10m", agent: "reviewer", task: "Review the diff" }, first.ctx);
+		assert.equal(result.isError, undefined);
+		assert.match(text(result), /Created schedule night-review/);
+		assert.equal(first.timers.values.size, 1);
+		const records = listScheduledRunSummaries(first.ctx.cwd, path.join(first.root, "stores"));
+		assert.equal(records[0]?.name, "Night review");
+		assert.equal(records[0]?.cwd, first.ctx.cwd);
+
+		first.manager.stop();
+		const secondTimers = new FakeTimers();
+		const second = createScheduledRunManager({
+			config: { scheduledRuns: { enabled: true } },
+			storeRoot: path.join(first.root, "stores"),
+			now: () => first.clock.now,
+			timers: secondTimers,
+			launch: async () => ({ content: [{ type: "text", text: "unused" }], details: { mode: "management", results: [] } }),
+		});
+		second.bindSession(context(first.ctx.cwd, "session-b"));
+		assert.equal(secondTimers.values.size, 1, "a different session restores the project schedule");
+		const shown = await second.handleToolCall({ action: "schedule.show", id: "night-review" }, context(first.ctx.cwd, "session-b"));
+		assert.match(text(shown), /Night review/);
+	});
+
+	it("stores explicit cwd schedules in the target project", async () => {
+		const h = harness();
+		const target = path.join(h.root, "other-project");
+		fs.mkdirSync(target);
+		await h.manager.handleToolCall({ action: "schedule.create", id: "other", cwd: target, every: "1h", agent: "worker" }, h.ctx);
+		assert.equal(listScheduledRunSummaries(h.ctx.cwd, path.join(h.root, "stores")).length, 0);
+		assert.equal(listScheduledRunSummaries(target, path.join(h.root, "stores"))[0]?.cwd, target);
+		const listed = await h.manager.handleToolCall({ action: "schedule.list", cwd: target }, h.ctx);
+		assert.match(text(listed), /other/);
+	});
+
+	it("supports workflowScript targets and rejects unsafe or deferred shapes", async () => {
+		const h = harness();
+		const workflow = await h.manager.handleToolCall({ action: "schedule.create", id: "workflow", every: "6h", workflowScript: "return await runs.run('review', {agent:'reviewer'})" }, h.ctx);
+		assert.equal(workflow.isError, undefined);
+		assert.match(text(workflow), /workflowScript/);
+		for (const params of [
+			{ action: "schedule.create", id: "../escape", every: "1h", agent: "worker" },
+			{ action: "schedule.create", id: "both", at: "+1h", every: "1h", agent: "worker" },
+			{ action: "schedule.create", id: "calendar", every: "day", at: "09:00", timezone: "UTC", agent: "worker" },
+			{ action: "schedule.create", id: "two-targets", every: "1h", agent: "worker", workflowScript: "return 1" },
+			{ action: "schedule.create", id: "fork", every: "1h", agent: "worker", context: "fork" },
+		] as const) {
+			const result = await h.manager.handleToolCall(params, h.ctx);
+			assert.equal(result.isError, true, JSON.stringify(params));
 		}
 	});
 
-	function freshHarness(options: { config?: ExtensionConfig; now?: number } = {}): TestHarness {
-		const harness = createHarness(options);
-		storeRoots.push(harness.storeRoot);
-		return harness;
-	}
-
-	it("rejects schedule actions when the feature is disabled", async () => {
-		const harness = freshHarness({ config: makeConfig({ enabled: false }) });
-		const result = await harness.manager.handleToolCall({ action: "schedule", agent: "scout", task: "x", schedule: "+10m" }, harness.ctx);
-		assert.equal(isError(result), true);
-		assert.match(result.content[0]!.text, /disabled/);
-		assert.equal(harness.timers.pendingCount(), 0);
+	it("pauses, resumes, lists, and deletes an inactive schedule", async () => {
+		const h = harness();
+		await h.manager.handleToolCall({ action: "schedule.create", id: "maintenance", every: "1h", agent: "worker" }, h.ctx);
+		assert.match(text(await h.manager.handleToolCall({ action: "schedule.list" }, h.ctx)), /maintenance/);
+		assert.match(text(await h.manager.handleToolCall({ action: "schedule.pause", id: "maintenance" }, h.ctx)), /Paused/);
+		assert.equal(h.timers.values.size, 0);
+		assert.match(text(await h.manager.handleToolCall({ action: "schedule.resume", id: "maintenance" }, h.ctx)), /Resumed/);
+		assert.equal(h.timers.values.size, 1);
+		assert.match(text(await h.manager.handleToolCall({ action: "schedule.delete", id: "maintenance" }, h.ctx)), /Deleted/);
+		assert.match(text(await h.manager.handleToolCall({ action: "schedule.list" }, h.ctx)), /No project schedules/);
 	});
 
-	it("rejects capability-ceiling-restricted schedules instead of persisting policy-less jobs", async () => {
-		const harness = createHarness({ resolveCapabilityCeiling: () => ({ version: 1, allowedTools: ["read"], denyExtensions: true, sources: ["plan"] }) });
-		const result = await harness.manager.handleToolCall({ action: "schedule", agent: "worker", task: "review", schedule: "+10m" }, harness.ctx);
-		assert.equal(isError(result), true);
-		assert.match(result.content[0]!.text, /does not yet persist ceilings/);
-		assert.equal(harness.launches.length, 0);
-	});
-
-
-	it("rejects schedules restricted only by inherited process policy", async () => {
-		const previous = process.env.PI_SUBAGENT_CAPABILITY_CEILING_V1;
-		try {
-			process.env.PI_SUBAGENT_CAPABILITY_CEILING_V1 = encodeSubagentCapabilityCeiling({ version: 1, allowedTools: ["read"], denyExtensions: true, sources: ["ancestor"] });
-			const harness = createHarness({ resolveCapabilityCeiling: resolveCurrentSubagentCapabilityCeiling });
-			const result = await harness.manager.handleToolCall({ action: "schedule", agent: "worker", task: "review", schedule: "+10m" }, harness.ctx);
-			assert.equal(isError(result), true);
-			assert.match(result.content[0]!.text, /does not yet persist ceilings/);
-			assert.equal(harness.launches.length, 0);
-		} finally {
-			if (previous === undefined) delete process.env.PI_SUBAGENT_CAPABILITY_CEILING_V1;
-			else process.env.PI_SUBAGENT_CAPABILITY_CEILING_V1 = previous;
-		}
-	});
-
-	it("creates a scheduled job and arms a timer", async () => {
-		const harness = freshHarness();
-		const result = await harness.manager.handleToolCall({ action: "schedule", agent: "scout", task: "review later", schedule: "+10m", scheduleName: "nightly review" }, harness.ctx);
-		assert.equal(isError(result), false);
-		assert.match(result.content[0]!.text, /Scheduled subagent run id-/);
-		assert.match(result.content[0]!.text, /nightly review/);
-		assert.equal(harness.timers.pendingCount(), 1);
-		const list = await harness.manager.handleToolCall({ action: "schedule-list" }, harness.ctx);
-		assert.match(list.content[0]!.text, /nightly review/);
-	});
-
-	it("requires exactly one execution mode", async () => {
-		const harness = freshHarness();
-		// tasks + chain is genuinely ambiguous (both are execution arrays)
-		const chainAndTasks = await harness.manager.handleToolCall({ action: "schedule", tasks: [{ agent: "scout", task: "x" }], chain: [{ agent: "scout", task: "y" }], schedule: "+10m" }, harness.ctx);
-		assert.match(chainAndTasks.content[0]!.text, /exactly one execution mode/);
-		// no execution mode at all
-		const none = await harness.manager.handleToolCall({ action: "schedule", schedule: "+10m" }, harness.ctx);
-		assert.match(none.content[0]!.text, /exactly one execution mode/);
-	});
-
-	it("rejects explicit reviewed acceptance at every scheduled nesting level before persisting a job", async () => {
-		const harness = freshHarness();
-		const cases = [
-			{ agent: "scout", task: "review later", acceptance: "reviewed" },
-			{ agent: "scout", task: "review later", acceptance: { level: "reviewed" } },
-			{ tasks: [{ agent: "scout", task: "review later", acceptance: "reviewed" }] },
-			{ chain: [{ agent: "scout", task: "review later", acceptance: { level: "reviewed" } }] },
-			{ chain: [{ parallel: [{ agent: "scout", task: "review later", acceptance: "reviewed" }] }] },
-		];
-		for (const params of cases) {
-			const result = await harness.manager.handleToolCall({
-				action: "schedule",
-				schedule: "+10m",
-				...params,
-			}, harness.ctx);
-			assert.equal(isError(result), true);
-			assert.match(result.content[0]!.text, /achieved status.*omit acceptance.*acceptance\.review\.required/i);
-		}
-		assert.equal(harness.timers.pendingCount(), 0);
-	});
-
-	it("requires a schedule and rejects fork/async-false/clarify-true", async () => {
-		const harness = freshHarness();
-		const noSchedule = await harness.manager.handleToolCall({ action: "schedule", agent: "scout", task: "x" }, harness.ctx);
-		assert.match(noSchedule.content[0]!.text, /requires schedule/);
-		const fork = await harness.manager.handleToolCall({ action: "schedule", agent: "scout", task: "x", schedule: "+10m", context: "fork" }, harness.ctx);
-		assert.match(fork.content[0]!.text, /fresh context/);
-		const sync = await harness.manager.handleToolCall({ action: "schedule", agent: "scout", task: "x", schedule: "+10m", async: false }, harness.ctx);
-		assert.match(sync.content[0]!.text, /always async/);
-		const clarify = await harness.manager.handleToolCall({ action: "schedule", agent: "scout", task: "x", schedule: "+10m", clarify: true }, harness.ctx);
-		assert.match(clarify.content[0]!.text, /clarify/);
-	});
-
-	it("rejects a past schedule time", async () => {
-		const harness = freshHarness({ now: Date.now() + 60_000 });
-		const result = await harness.manager.handleToolCall({ action: "schedule", agent: "scout", task: "x", schedule: "2020-01-01T00:00:00Z" }, harness.ctx);
-		assert.match(result.content[0]!.text, /in the past/);
-	});
-
-	it("enforces maxPending", async () => {
-		const harness = freshHarness({ config: makeConfig({ maxPending: 1 }) });
-		const first = await harness.manager.handleToolCall({ action: "schedule", agent: "scout", task: "x", schedule: "+10m" }, harness.ctx);
-		assert.equal(isError(first), false);
-		const second = await harness.manager.handleToolCall({ action: "schedule", agent: "scout", task: "y", schedule: "+20m" }, harness.ctx);
-		assert.match(second.content[0]!.text, /limit reached/);
-	});
-
-	it("status resolves by exact id and prefix, and rejects ambiguous/missing", async () => {
-		const harness = freshHarness();
-		const created = await harness.manager.handleToolCall({ action: "schedule", agent: "scout", task: "x", schedule: "+10m" }, harness.ctx);
-		const id = extractId(created);
-		const status = await harness.manager.handleToolCall({ action: "schedule-status", id }, harness.ctx);
-		assert.match(status.content[0]!.text, /State: scheduled/);
-		assert.match(status.content[0]!.text, /Cancel: subagent/);
-		const byPrefix = await harness.manager.handleToolCall({ action: "schedule-status", id: id.slice(0, 4) }, harness.ctx);
-		assert.match(byPrefix.content[0]!.text, /State: scheduled/);
-		const missing = await harness.manager.handleToolCall({ action: "schedule-status", id: "nope" }, harness.ctx);
-		assert.match(missing.content[0]!.text, /not found/);
-		const noId = await harness.manager.handleToolCall({ action: "schedule-status" }, harness.ctx);
-		assert.match(noId.content[0]!.text, /requires id/);
-	});
-
-	it("cancel clears the timer and marks the job canceled", async () => {
-		const harness = freshHarness();
-		const created = await harness.manager.handleToolCall({ action: "schedule", agent: "scout", task: "x", schedule: "+10m" }, harness.ctx);
-		const id = extractId(created);
-		assert.equal(harness.timers.pendingCount(), 1);
-		const canceled = await harness.manager.handleToolCall({ action: "schedule-cancel", id }, harness.ctx);
-		assert.match(canceled.content[0]!.text, /Canceled scheduled subagent run/);
-		assert.equal(harness.timers.pendingCount(), 0);
-		const status = await harness.manager.handleToolCall({ action: "schedule-status", id }, harness.ctx);
-		assert.match(status.content[0]!.text, /State: canceled/);
-	});
-
-	it("cancel refuses a terminal job", async () => {
-		const harness = freshHarness();
-		const created = await harness.manager.handleToolCall({ action: "schedule", agent: "scout", task: "x", schedule: "+10m" }, harness.ctx);
-		const id = extractId(created);
-		await harness.manager.handleToolCall({ action: "schedule-cancel", id }, harness.ctx);
-		const again = await harness.manager.handleToolCall({ action: "schedule-cancel", id }, harness.ctx);
-		assert.match(again.content[0]!.text, /already canceled/);
-	});
-
-	it("reports malformed persisted job records instead of dropping them", async () => {
-		const harness = freshHarness();
-		const sessionId = harness.ctx.sessionManager.getSessionFile()!;
-		const storePath = scheduledRunStorePath(harness.ctx.cwd, sessionId, harness.storeRoot);
-		fs.mkdirSync(path.dirname(storePath), { recursive: true });
-		fs.writeFileSync(storePath, JSON.stringify({ version: 1, cwd: harness.ctx.cwd, sessionId, jobs: [{ id: "bad" }] }), "utf-8");
-		const result = await harness.manager.handleToolCall({ action: "schedule-list" }, harness.ctx);
-		assert.equal(isError(result), true);
-		assert.match(result.content[0]!.text, /job 0 has invalid string fields/);
-	});
-
-	it("reports JSON parse errors from a corrupted persisted store", async () => {
-		const harness = freshHarness();
-		const sessionId = harness.ctx.sessionManager.getSessionFile()!;
-		const storePath = scheduledRunStorePath(harness.ctx.cwd, sessionId, harness.storeRoot);
-		fs.mkdirSync(path.dirname(storePath), { recursive: true });
-		fs.writeFileSync(storePath, "{ not-json", "utf-8");
-		const result = await harness.manager.handleToolCall({ action: "schedule-list" }, harness.ctx);
-		assert.equal(isError(result), true);
-		assert.match(result.content[0]!.text, /Failed to parse scheduled subagent store/);
-		assert.match(result.content[0]!.text, /JSON/);
+	it("reports corrupt project schedule records instead of dropping them", async () => {
+		const h = harness();
+		const root = scheduledRunStorePath(h.ctx.cwd, undefined, path.join(h.root, "stores"));
+		const dir = path.join(root, "broken");
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(path.join(dir, "schedule.json"), "{ bad", "utf-8");
+		const result = await h.manager.handleToolCall({ action: "schedule.list" }, h.ctx);
+		assert.equal(result.isError, true);
+		assert.match(text(result), /Failed to read schedule record/);
 	});
 });
 
-describe("ScheduledRunManager firing", () => {
-	let storeRoots: string[] = [];
-	after(() => {
-		for (const root of storeRoots) {
-			try {
-				fs.rmSync(root, { recursive: true, force: true });
-			} catch {
-				// best-effort cleanup of temp test dirs
-			}
-		}
+describe("recurring schedule execution", () => {
+	it("launches a fixed interval from its planned time and records durable history/events", async () => {
+		const h = harness();
+		await h.manager.handleToolCall({ action: "schedule.create", id: "hourly", every: "1h", agent: "worker", task: "Maintain backlog", missionId: "mission-1" }, h.ctx);
+		h.clock.now += 3_600_000;
+		h.timers.fireAll();
+		assert.equal(h.launches.length, 1);
+		assert.deepEqual(h.launches[0]?.params, { agent: "worker", task: "Maintain backlog", async: true, clarify: false, context: "fresh", cwd: h.ctx.cwd, missionId: "mission-1" });
+		h.launches[0]!.resolve({ content: [{ type: "text", text: "Async worker" }], details: { mode: "single", results: [], asyncId: "async-1", asyncDir: "/tmp/async-1" } });
+		await flush();
+
+		let history = await h.manager.handleToolCall({ action: "schedule.history", id: "hourly" }, h.ctx);
+		assert.match(text(history), /running.*async async-1/);
+		const scheduleRoot = scheduledRunStorePath(h.ctx.cwd, undefined, path.join(h.root, "stores"));
+		const dir = path.join(scheduleRoot, "hourly");
+		assert.equal(fs.existsSync(path.join(dir, "history.json")), true);
+		assert.equal(fs.existsSync(path.join(dir, "events.jsonl")), true);
+		assert.equal(fs.readdirSync(path.join(dir, "runs")).length, 1);
+
+		h.manager.handleAsyncCompletion({ runId: "async-1", success: true, summary: "Done" });
+		history = await h.manager.handleToolCall({ action: "schedule.history", id: "hourly" }, h.ctx);
+		assert.match(text(history), /completed.*async async-1/);
+		assert.equal(fs.existsSync(path.join(dir, "active.lock")), false);
+		const shown = await h.manager.handleToolCall({ action: "schedule.show", id: "hourly" }, h.ctx);
+		assert.match(text(shown), /2030-01-01T02:00:00.000Z/, "next occurrence advances from the planned time without completion drift");
 	});
 
-	function freshHarness(options: { config?: ExtensionConfig; now?: number } = {}): TestHarness {
-		const harness = createHarness(options);
-		storeRoots.push(harness.storeRoot);
-		return harness;
-	}
+	it("run-due launches the latest missed occurrence while catchUp none records a miss", async () => {
+		const latest = harness();
+		await latest.manager.handleToolCall({ action: "schedule.create", id: "latest", every: "1h", catchUp: "latest", agent: "worker" }, latest.ctx);
+		latest.manager.stop();
+		latest.clock.now += 3 * 3_600_000;
+		latest.manager.bindSession(latest.ctx);
+		const duePromise = latest.manager.handleToolCall({ action: "schedule.run-due" }, latest.ctx);
+		await flush();
+		assert.equal(latest.launches.length, 1);
+		latest.launches[0]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "single", results: [], asyncId: "late-1" } });
+		assert.match(text(await duePromise), /Ran 1 due schedule/);
+		assert.match(text(await latest.manager.handleToolCall({ action: "schedule.history", id: "latest" }, latest.ctx)), /2030-01-01T03:00:00.000Z/, "latest catch-up selects the latest missed slot");
 
-	it("launches the sanitized async run when the timer fires", async () => {
-		const harness = freshHarness();
-		const created = await harness.manager.handleToolCall({ action: "schedule", agent: "scout", task: "review", schedule: "+10m", scheduleName: "rev" }, harness.ctx);
-		const id = extractId(created);
-		harness.clock.now += 10 * 60_000; // advance to runAt so fire() launches instead of re-arming
-		harness.timers.fireAll();
-		assert.equal(harness.launches.length, 1, "launch should be invoked once when the timer fires");
-		const launch = harness.launches[0]!;
-		assert.equal(launch.params.async, true);
-		assert.equal(launch.params.clarify, false);
-		assert.equal(launch.params.context, "fresh");
-		assert.equal(launch.params.agent, "scout");
-		assert.equal(launch.params.task, "review");
-		assert.equal((launch.params as { action?: string }).action, undefined, "action must be stripped before launch");
-		assert.equal((launch.params as { schedule?: string }).schedule, undefined, "schedule must be stripped before launch");
-
-		launch.resolve({
-			content: [{ type: "text", text: "Async: scout [run-xyz]" }],
-			details: { mode: "single", runId: "run-xyz", asyncId: "run-xyz", asyncDir: "/tmp/async-xyz", results: [] },
-		});
-		await flushMicrotasks();
-
-		const status = await harness.manager.handleToolCall({ action: "schedule-status", id }, harness.ctx);
-		assert.match(status.content[0]!.text, /State: fired/);
-		assert.match(status.content[0]!.text, /Launched async run: run-xyz/);
-		assert.match(status.content[0]!.text, /Async dir: \/tmp\/async-xyz/);
+		const none = harness();
+		await none.manager.handleToolCall({ action: "schedule.create", id: "none", every: "1h", catchUp: "none", agent: "worker" }, none.ctx);
+		none.manager.stop();
+		none.clock.now += 3 * 3_600_000;
+		none.manager.bindSession(none.ctx);
+		assert.match(text(await none.manager.handleToolCall({ action: "schedule.history", id: "none" }, none.ctx)), /missed/);
+		assert.equal(none.launches.length, 0);
 	});
 
-	it("marks the job failed when launch returns an error result", async () => {
-		const harness = freshHarness();
-		const created = await harness.manager.handleToolCall({ action: "schedule", agent: "scout", task: "x", schedule: "+1m" }, harness.ctx);
-		const id = extractId(created);
-		harness.clock.now += 60_000; // advance to runAt
-		harness.timers.fireAll();
-		assert.equal(harness.launches.length, 1);
-		harness.launches[0]!.resolve({
-			content: [{ type: "text", text: "Async mode requires jiti" }],
-			details: { mode: "single", results: [] },
-			isError: true,
-		});
-		await flushMicrotasks();
-		const status = await harness.manager.handleToolCall({ action: "schedule-status", id }, harness.ctx);
-		assert.match(status.content[0]!.text, /State: failed/);
-		assert.match(status.content[0]!.text, /Async mode requires jiti/);
+	it("manual run uses the normal async target and overlap skip prevents a second launch", async () => {
+		const h = harness();
+		await h.manager.handleToolCall({ action: "schedule.create", id: "manual", every: "1h", workflowScript: "return 1" }, h.ctx);
+		const firstPromise = h.manager.handleToolCall({ action: "schedule.run", id: "manual" }, h.ctx);
+		await flush();
+		assert.equal(h.launches.length, 1);
+		h.launches[0]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "workflow", results: [], asyncId: "workflow-1" } });
+		assert.match(text(await firstPromise), /async workflow-1/);
+		const second = await h.manager.handleToolCall({ action: "schedule.run", id: "manual" }, h.ctx);
+		assert.match(text(second), /skipped/);
+		assert.equal(h.launches.length, 1);
 	});
 
-	it("marks the job failed when launch throws", async () => {
-		const storeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sched-throw-"));
-		storeRoots.push(storeRoot);
-		const ctx = makeCtx();
-		const timers = new FakeTimers();
-		const clock = { now: 1_000_000 };
-		const throwingManager = createScheduledRunManager({
-			config: makeConfig(),
-			storeRoot,
-			now: () => clock.now,
-			randomId: () => "id-" + randomUUID().slice(0, 4),
-			timers,
-			launch: () => Promise.reject(new Error("spawn ENOENT")),
-		});
-		throwingManager.bindSession(ctx);
-		const created = await throwingManager.handleToolCall({ action: "schedule", agent: "scout", task: "x", schedule: "+1m" }, ctx);
-		const id = extractId(created);
-		clock.now += 60_000; // advance to runAt
-		timers.fireAll();
-		await flushMicrotasks();
-		const status = await throwingManager.handleToolCall({ action: "schedule-status", id }, ctx);
-		assert.match(status.content[0]!.text, /State: failed/);
-		assert.match(status.content[0]!.text, /spawn ENOENT/);
-	});
+	it("distinguishes failed launch from failed async completion", async () => {
+		const h = harness();
+		await h.manager.handleToolCall({ action: "schedule.create", id: "failures", every: "1h", agent: "worker" }, h.ctx);
+		const first = h.manager.handleToolCall({ action: "schedule.run", id: "failures" }, h.ctx);
+		await flush();
+		h.launches[0]!.resolve({ content: [{ type: "text", text: "spawn failed" }], details: { mode: "management", results: [] }, isError: true });
+		assert.match(text(await first), /failed_launch/);
 
-	it("re-arms instead of launching when a capped timer fires before runAt", async () => {
-		const harness = freshHarness({ now: 1_000_000 });
-		// +25d exceeds MAX_TIMER_DELAY_MS so the armed timer is capped and would fire "early" in fake time.
-		const created = await harness.manager.handleToolCall({ action: "schedule", agent: "scout", task: "x", schedule: "+25d" }, harness.ctx);
-		const id = extractId(created);
-		harness.timers.fireAll();
-		assert.equal(harness.launches.length, 0, "must not launch before runAt");
-		assert.equal(harness.timers.pendingCount(), 1, "must re-arm a new timer");
-		// Advance time to runAt and fire again -> now it launches.
-		harness.clock.now = 1_000_000 + 25 * 86_400_000;
-		harness.timers.fireAll();
-		assert.equal(harness.launches.length, 1, "must launch once runAt is reached");
-		harness.launches[0]!.resolve({
-			content: [{ type: "text", text: "Async: scout [run-1]" }],
-			details: { mode: "single", runId: "run-1", asyncId: "run-1", results: [] },
-		});
-		await flushMicrotasks();
-		const status = await harness.manager.handleToolCall({ action: "schedule-status", id }, harness.ctx);
-		assert.match(status.content[0]!.text, /State: fired/);
-	});
-
-	it("cancel before fire prevents the launch", async () => {
-		const harness = freshHarness();
-		const created = await harness.manager.handleToolCall({ action: "schedule", agent: "scout", task: "x", schedule: "+10m" }, harness.ctx);
-		const id = extractId(created);
-		await harness.manager.handleToolCall({ action: "schedule-cancel", id }, harness.ctx);
-		harness.timers.fireAll();
-		assert.equal(harness.launches.length, 0, "a canceled job must not launch");
-	});
-});
-
-describe("ScheduledRunManager restart restore", () => {
-	let storeRoots: string[] = [];
-	after(() => {
-		for (const root of storeRoots) {
-			try {
-				fs.rmSync(root, { recursive: true, force: true });
-			} catch {
-				// best-effort cleanup of temp test dirs
-			}
-		}
-	});
-
-	it("re-arms pending jobs and marks stale jobs missed after a restart", async () => {
-		const storeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sched-restore-"));
-		storeRoots.push(storeRoot);
-		const ctx = makeCtx();
-		const clock = { now: 1_000_000 };
-		const timersA = new FakeTimers();
-		const managerA = createScheduledRunManager({
-			config: makeConfig({ maxLatenessMs: 60_000 }),
-			storeRoot,
-			now: () => clock.now,
-			randomId: () => "id-" + randomUUID().slice(0, 4),
-			timers: timersA,
-			launch: () => Promise.resolve({ content: [{ type: "text", text: "ok" }], details: { mode: "single", results: [] } }),
-		});
-		managerA.bindSession(ctx);
-		const soon = await managerA.handleToolCall({ action: "schedule", agent: "scout", task: "soon", schedule: "+10m" }, ctx);
-		const later = await managerA.handleToolCall({ action: "schedule", agent: "scout", task: "later", schedule: "+1h" }, ctx);
-		const soonId = extractId(soon);
-		const laterId = extractId(later);
-		assert.equal(timersA.pendingCount(), 2);
-		managerA.stop();
-
-		// Simulate Pi being offline past the first job's window but before the second fires.
-		clock.now = 1_000_000 + 20 * 60_000; // +20m: soon is 10m overdue (> maxLateness 1m), later is still 40m out.
-		const timersB = new FakeTimers();
-		const managerB = createScheduledRunManager({
-			config: makeConfig({ maxLatenessMs: 60_000 }),
-			storeRoot,
-			now: () => clock.now,
-			randomId: () => "id-" + randomUUID().slice(0, 4),
-			timers: timersB,
-			launch: () => Promise.resolve({ content: [{ type: "text", text: "ok" }], details: { mode: "single", results: [] } }),
-		});
-		managerB.bindSession(ctx);
-		const soonStatus = await managerB.handleToolCall({ action: "schedule-status", id: soonId }, ctx);
-		assert.match(soonStatus.content[0]!.text, /State: missed/);
-		const laterStatus = await managerB.handleToolCall({ action: "schedule-status", id: laterId }, ctx);
-		assert.match(laterStatus.content[0]!.text, /State: scheduled/);
-		assert.equal(timersB.pendingCount(), 1, "only the still-future job should be re-armed");
-		managerB.stop();
-	});
-
-	it("store path lives under the scheduled runs dir by default", () => {
-		const p = scheduledRunStorePath("/project", "sess1");
-		assert.ok(p.startsWith(SCHEDULED_RUNS_DIR), `${p} should be under ${SCHEDULED_RUNS_DIR}`);
+		const second = h.manager.handleToolCall({ action: "schedule.run", id: "failures" }, h.ctx);
+		await flush();
+		h.launches[1]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "single", results: [], asyncId: "async-fail" } });
+		await second;
+		h.manager.handleAsyncCompletion({ id: "async-fail", success: false, summary: "child failed" });
+		const history = await h.manager.handleToolCall({ action: "schedule.history", id: "failures" }, h.ctx);
+		assert.match(text(history), /failed_run.*async async-fail/);
+		assert.match(text(history), /failed_launch/);
 	});
 });

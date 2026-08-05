@@ -144,7 +144,7 @@ import {
 	wrapForkTask,
 } from "../../shared/types.ts";
 
-const MUTATING_MANAGEMENT_ACTIONS = new Set(["create", "update", "delete", "eject", "disable", "enable", "reset", "grant-spawn-budget", "watchdog.configure", "mission.create", "mission.update", "mission.attach-run", "mission.close", "inspector.open", "inspector.close", "project.open", "project.close", "worktree.discard"]);
+const MUTATING_MANAGEMENT_ACTIONS = new Set(["create", "update", "delete", "eject", "disable", "enable", "reset", "grant-spawn-budget", "watchdog.configure", "mission.create", "mission.update", "mission.attach-run", "mission.close", "inspector.open", "inspector.close", "project.open", "project.close", "worktree.discard", "schedule.create", "schedule.pause", "schedule.resume", "schedule.run", "schedule.run-due", "schedule.delete"]);
 
 type UndefinedOmitted<T extends object> = {
 	[K in keyof T as undefined extends T[K] ? never : K]: T[K];
@@ -256,6 +256,12 @@ export interface SubagentParamsLike {
 	agentContract?: AgentContract;
 	schedule?: string;
 	scheduleName?: string;
+	at?: string;
+	every?: string;
+	on?: string | number;
+	timezone?: string;
+	overlap?: "skip";
+	catchUp?: "none" | "latest";
 	additional?: number;
 	missionId?: string;
 	mission?: unknown;
@@ -4257,7 +4263,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					...(currentSessionId ? { currentSessionId } : {}),
 				});
 			}
-			const policyAction = action === "stop" ? "stopRun" : action === "steer" ? "steerRun" : action === "schedule" ? "scheduleCreate" : undefined;
+			const policyAction = action === "stop" ? "stopRun" : action === "steer" ? "steerRun" : action === "schedule.create" ? "scheduleCreate" : undefined;
 			if (policyAction) {
 				const decision = resolveAuthorityDecision({ action: policyAction, ...(deps.config.authorityPolicy === undefined ? {} : { policy: deps.config.authorityPolicy }) });
 				if (decision === "forbid") {
@@ -4566,7 +4572,14 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			if (action === "append-step") {
 				return appendStepToAsyncChain(omitUndefinedProperties({ params: paramsWithResolvedCwd, requestCwd, ctx, deps, parentModel: requestParentModel }));
 			}
-			if (action === "schedule" || action === "schedule-list" || action === "schedule-status" || action === "schedule-cancel") {
+			if (action.startsWith("schedule.")) {
+				if (deps.allowMutatingManagementActions === false && MUTATING_MANAGEMENT_ACTIONS.has(action)) {
+					return {
+						content: [{ type: "text", text: `Action '${action}' is not available from child-safe subagent fanout mode.` }],
+						isError: true,
+						details: { mode: "management", results: [] },
+					};
+				}
 				if (!deps.handleScheduledRunAction) {
 					return {
 						content: [{ type: "text", text: `Action '${action}' is not available in this subagent context.` }],

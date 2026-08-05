@@ -496,6 +496,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	};
 	const asyncCompleteHandler = (payload: unknown) => {
 		handleComplete(payload);
+		scheduledRunManager.handleAsyncCompletion(payload);
 		try {
 			syncMissionFromAsyncCompletion(payload);
 		} catch (error) {

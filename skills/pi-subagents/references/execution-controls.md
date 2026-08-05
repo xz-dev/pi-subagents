@@ -159,22 +159,26 @@ A cooperating terminal runtime can register read-only external records through `
 
 ### Scheduled subagent runs
 
-Scheduled runs defer a subagent launch until a future time. They are enabled by default; set `{ "scheduledRuns": { "enabled": false } }` in `~/.pi/agent/extensions/subagent/config.json` to disable them. Only schedule explicit delayed runs the user asked for; do not schedule runs speculatively.
+Schedules are durable project records under `.pi-subagents/schedules/`. They are enabled by default; set `{ "scheduledRuns": { "enabled": false } }` in `~/.pi/agent/extensions/subagent/config.json` to disable them. Only schedule explicit work the user asked for.
 
 ```typescript
-// Launch a reviewer in 30 minutes
-subagent({ action: "schedule", agent: "reviewer", task: "Review the diff for correctness issues.", schedule: "+30m", scheduleName: "evening review" })
+// One-shot reviewer
+subagent({ action: "schedule.create", id: "evening-review", name: "Evening review", at: "+30m", agent: "reviewer", task: "Review the diff." })
 
+// Fixed recurring workflow
+subagent({ action: "schedule.create", id: "backlog", every: "6h", catchUp: "latest", workflowScript: "..." })
 
-// Inspect, list, and cancel
-subagent({ action: "schedule-list" })
-subagent({ action: "schedule-status", id: "ab12" })
-subagent({ action: "schedule-cancel", id: "ab12" })
+subagent({ action: "schedule.list" })
+subagent({ action: "schedule.show", id: "backlog" })
+subagent({ action: "schedule.history", id: "backlog" })
+subagent({ action: "schedule.pause", id: "backlog" })
+subagent({ action: "schedule.resume", id: "backlog" })
+subagent({ action: "schedule.run", id: "backlog" })
+subagent({ action: "schedule.run-due" })
+subagent({ action: "schedule.delete", id: "backlog" })
 ```
 
-`schedule` accepts single-agent execution fields (`agent`, `cwd`, `model`, `output`, `reads`, `progress`, `acceptance`, `timeoutMs` / `maxRuntimeMs`) plus `schedule` (a relative delay like `+10m`/`+2h`/`+1d` or a future ISO timestamp with a timezone such as `2030-01-01T09:00:00Z`) and an optional `scheduleName`. Scheduled runs always launch async with fresh context; `context: "fork"`, `async: false`, and `clarify: true` are rejected. Once the timer fires, the run becomes a normal tracked async run: it appears in the async widget, is inspectable with `subagent({ action: "status" })`, can be awaited with `subagent_wait()`, and delivers the normal completion notification.
-
-Schedules are persisted per session and restored after a Pi restart. A job whose scheduled time passed by more than `scheduledRuns.maxLatenessMs` (default 5 minutes) while Pi was unavailable is marked `missed` instead of firing late. `scheduledRuns.maxPending` (default 20) caps pending or running scheduled jobs per session.
+`schedule.create` accepts exactly one target (`workflowScript`, or `agent` with optional `task`) and exactly one trigger (`at`, or a fixed `every` interval using `m`, `h`, `d`, or `w`). Runs always launch async with fresh context. `overlap` is currently `skip`; `catchUp` supports `latest` and `none`. `schedule.run-due` is the headless external-launcher seam. Calendar recurrence, cron, and the schedule inspector are deferred from this first safe slice. Definitions, bounded history, append-only events, and per-run receipts remain project-scoped across Pi sessions.
 
 Humans can use `/subagents-doctor` for the same read-only report. It checks runtime paths, discovery counts, async support, current session context, and intercom bridge state.
 

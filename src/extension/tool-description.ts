@@ -30,7 +30,7 @@ MANAGEMENT / CONTROL (use action; omit execution fields):
 • status, interrupt, stop, resume, and steer manage live or persisted runs. Use status view:"fleet" for an overview or view:"transcript" with id and optional index to tail output.
 • { action: "append-step", id: "...", step: {agent:"agent-c", task:"Use {previous}"} } appends one step to an already-running durable legacy chain. step is control-only, not an execution mode.
 • approve-checkpoint and reject-checkpoint decide a paused durable legacy chain checkpoint.
-• Schedule a single child with { action:"schedule", agent, task?, schedule:"+10m", scheduleName? }. Scheduled runs always launch async with fresh context.
+• Create durable project schedules with { action:"schedule.create", id?, name?, at:"+10m" | ISO, agent, task? } or { every:"6h", workflowScript }. Manage them with schedule.list/show/history/pause/resume/run/run-due/delete. This first slice supports fixed intervals; calendar schedules are deferred.
 
 ${SUBAGENT_SAFETY_GUIDANCE}`;
 
