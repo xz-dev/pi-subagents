@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Added opt-in `inlineToolDisplay: "summary"` for a stable one-row inline subagent result while FleetView remains the live progress surface.
 - Added an observational `pi-subagents/external-runs` provider API for visible terminal work, without taking process ownership. Thanks to @nicobailon for #795.
 - Added durable non-blocking `subagent_wait({ id, nonBlocking: true })` subscriptions that return immediately, preserve exact run identity, remain visible in status, and wake the originating interactive session on terminal, attention, reconciliation-failure, or timeout outcomes.
 - Added narrow public entrypoints for extension consumers to access async stop requests, intercom session targeting, launch tool-plan resolution, and fork-task helpers without deep imports. Thanks to @shaneconner for #794.
