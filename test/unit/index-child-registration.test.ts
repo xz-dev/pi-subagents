@@ -85,9 +85,13 @@ describe("subagent extension child mode", () => {
 			if (!registeredTool) throw new Error("tool not registered");
 			const theme = { fg(_name, text) { return text; }, bold(text) { return text; } };
 			const single = registeredTool.renderCall({ agent: "worker", async: true }, theme).text;
-			const workflow = registeredTool.renderCall({ workflowScript: "return null" }, theme).text;
+			const workflow = registeredTool.renderCall({
+				workflowScript: "const scan = await runs.run('scan', {agent:'worker'}); return runs.all([{key:'correctness',agent:'reviewer'},{key:'tests',agent:'reviewer'}]);",
+			}, theme).text;
+			const foregroundWorkflow = registeredTool.renderCall({ workflowScript: "return runs.run('publish', {agent:'worker'});", async: false }, theme).text;
 			if (!single.includes("worker [async]")) throw new Error("expected async single badge, got " + single);
-			if (!workflow.includes("workflow script")) throw new Error("expected workflow label, got " + workflow);
+			if (!workflow.includes("background · 3 lanes: scan, correctness, tests")) throw new Error("expected workflow manifest, got " + workflow);
+			if (!foregroundWorkflow.includes("foreground · 1 lane: publish")) throw new Error("expected foreground workflow manifest, got " + foregroundWorkflow);
 		`;
 		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
 	});

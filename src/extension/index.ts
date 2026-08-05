@@ -76,6 +76,31 @@ import {
 
 export { loadConfig, resolveAsyncByDefault } from "./config.ts";
 
+function workflowLaneKeys(script: string): string[] {
+	const keys: string[] = [];
+	const seen = new Set<string>();
+	const add = (key: string): void => {
+		if (!seen.has(key)) {
+			seen.add(key);
+			keys.push(key);
+		}
+	};
+	const commentsOrWhitespace = String.raw`(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*)*`;
+	const literal = String.raw`(["'])([^"'\r\n]+)\1`;
+	for (const match of script.matchAll(new RegExp(String.raw`\bruns\.run\s*\(\s*${literal}(?=${commentsOrWhitespace}(?:,|\)))`, "g"))) add(match[2]!);
+	for (const match of script.matchAll(new RegExp(String.raw`\bkey\s*:\s*${literal}(?=${commentsOrWhitespace}(?:,|\}))`, "g"))) add(match[2]!);
+	return keys;
+}
+
+function formatWorkflowManifest(script: string, async: unknown, asyncByDefault: boolean, clarify: unknown): string {
+	const keys = workflowLaneKeys(script);
+	const mode = clarify === true || (async ?? asyncByDefault) !== true ? "foreground" : "background";
+	if (keys.length === 0) return `workflow script · ${mode}`;
+	const visibleKeys = keys.slice(0, 4).join(", ");
+	const remainder = keys.length > 4 ? `, +${keys.length - 4}` : "";
+	return `workflow · ${mode} · ${keys.length} lane${keys.length === 1 ? "" : "s"}: ${visibleKeys}${remainder}`;
+}
+
 /**
  * Derive subagent session base directory from parent session file.
  * If parent session is ~/.pi/agent/sessions/abc123.jsonl,
@@ -419,7 +444,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			}
 			if (args.workflowScript)
 				return new Text(
-					`${theme.fg("toolTitle", theme.bold("subagent "))}workflow script`,
+					`${theme.fg("toolTitle", theme.bold("subagent "))}${formatWorkflowManifest(args.workflowScript, args.async, asyncByDefault, args.clarify)}`,
 					0,
 					0,
 				);
