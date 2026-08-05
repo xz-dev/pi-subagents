@@ -106,7 +106,7 @@ describe("schedule helpers", () => {
 		const root = path.join("tmp", "schedules");
 		assert.equal(scheduledRunStorePath("project", "a", root), scheduledRunStorePath("project", "b", root));
 		assert.notEqual(scheduledRunStorePath("project", "a", root), scheduledRunStorePath("other", "a", root));
-		assert.equal(scheduledRunStorePath("/project"), path.join("/project", ".pi-subagents", "schedules"));
+		assert.equal(scheduledRunStorePath("/project"), path.join(path.resolve("/project"), ".pi-subagents", "schedules"));
 	});
 
 	it("parses one-shot and fixed interval forms strictly", () => {
@@ -174,6 +174,8 @@ describe("project schedule management", () => {
 			{ action: "schedule.create", id: "calendar", every: "day", at: "09:00", timezone: "UTC", agent: "worker" },
 			{ action: "schedule.create", id: "two-targets", every: "1h", agent: "worker", workflowScript: "return 1" },
 			{ action: "schedule.create", id: "fork", every: "1h", agent: "worker", context: "fork" },
+			{ action: "schedule.create", id: "mission-id", every: "1h", agent: "worker", missionId: "mission-1" },
+			{ action: "schedule.create", id: "mission-off", every: "1h", agent: "worker", mission: false },
 		] as const) {
 			const result = await h.manager.handleToolCall(params, h.ctx);
 			assert.equal(result.isError, true, JSON.stringify(params));
@@ -202,16 +204,29 @@ describe("project schedule management", () => {
 		assert.equal(result.isError, true);
 		assert.match(text(result), /Failed to read schedule record/);
 	});
+
+	it("rejects schedule directories that escape through a symlink", async () => {
+		const h = harness();
+		const root = scheduledRunStorePath(h.ctx.cwd, undefined, path.join(h.root, "stores"));
+		const outside = path.join(h.root, "outside");
+		fs.mkdirSync(root, { recursive: true });
+		fs.mkdirSync(outside);
+		fs.symlinkSync(outside, path.join(root, "escaped"), process.platform === "win32" ? "junction" : "dir");
+		const result = await h.manager.handleToolCall({ action: "schedule.create", id: "escaped", every: "1h", agent: "worker" }, h.ctx);
+		assert.equal(result.isError, true);
+		assert.match(text(result), /must be a real directory/);
+		assert.equal(fs.existsSync(path.join(outside, "schedule.json")), false);
+	});
 });
 
 describe("recurring schedule execution", () => {
 	it("launches a fixed interval from its planned time and records durable history/events", async () => {
 		const h = harness();
-		await h.manager.handleToolCall({ action: "schedule.create", id: "hourly", every: "1h", agent: "worker", task: "Maintain backlog", missionId: "mission-1" }, h.ctx);
+		await h.manager.handleToolCall({ action: "schedule.create", id: "hourly", every: "1h", agent: "worker", task: "Maintain backlog" }, h.ctx);
 		h.clock.now += 3_600_000;
 		h.timers.fireAll();
 		assert.equal(h.launches.length, 1);
-		assert.deepEqual(h.launches[0]?.params, { agent: "worker", task: "Maintain backlog", async: true, clarify: false, context: "fresh", cwd: h.ctx.cwd, missionId: "mission-1" });
+		assert.deepEqual(h.launches[0]?.params, { agent: "worker", task: "Maintain backlog", async: true, clarify: false, context: "fresh", cwd: h.ctx.cwd, mission: false });
 		h.launches[0]!.resolve({ content: [{ type: "text", text: "Async worker" }], details: { mode: "single", results: [], asyncId: "async-1", asyncDir: "/tmp/async-1" } });
 		await flush();
 
@@ -241,7 +256,7 @@ describe("recurring schedule execution", () => {
 		await flush();
 		assert.equal(latest.launches.length, 1);
 		latest.launches[0]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "single", results: [], asyncId: "late-1" } });
-		assert.match(text(await duePromise), /Ran 1 due schedule/);
+		assert.match(text(await duePromise), /Processed 1 due schedule/);
 		assert.match(text(await latest.manager.handleToolCall({ action: "schedule.history", id: "latest" }, latest.ctx)), /2030-01-01T03:00:00.000Z/, "latest catch-up selects the latest missed slot");
 
 		const none = harness();
@@ -251,6 +266,82 @@ describe("recurring schedule execution", () => {
 		none.manager.bindSession(none.ctx);
 		assert.match(text(await none.manager.handleToolCall({ action: "schedule.history", id: "none" }, none.ctx)), /missed/);
 		assert.equal(none.launches.length, 0);
+	});
+
+	it("keeps project timers and completion ownership when another project is selected", async () => {
+		const h = harness();
+		await h.manager.handleToolCall({ action: "schedule.create", id: "project-a", every: "1h", agent: "worker" }, h.ctx);
+		h.clock.now += 3_600_000;
+		h.timers.fireAll();
+		h.launches[0]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "single", results: [], asyncId: "async-a" } });
+		await flush();
+
+		const projectB = path.join(h.root, "project-b");
+		fs.mkdirSync(projectB);
+		await h.manager.handleToolCall({ action: "schedule.create", id: "project-b", cwd: projectB, every: "1h", agent: "worker" }, h.ctx);
+		assert.equal(h.timers.values.size, 2, "both project timers remain armed");
+
+		h.manager.handleAsyncCompletion({ runId: "async-a", success: true });
+		const history = await h.manager.handleToolCall({ action: "schedule.history", id: "project-a" }, h.ctx);
+		assert.match(text(history), /completed.*async async-a/);
+		const projectARoot = scheduledRunStorePath(h.ctx.cwd, undefined, path.join(h.root, "stores"));
+		assert.equal(fs.existsSync(path.join(projectARoot, "project-a", "active.lock")), false);
+	});
+
+	it("reconciles a terminal async status after a new session binds", async () => {
+		const h = harness();
+		await h.manager.handleToolCall({ action: "schedule.create", id: "restart", every: "1h", agent: "worker" }, h.ctx);
+		h.clock.now += 3_600_000;
+		h.timers.fireAll();
+		const asyncDir = path.join(h.root, "async-restart");
+		fs.mkdirSync(asyncDir);
+		h.launches[0]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "single", results: [], asyncId: "async-restart", asyncDir } });
+		await flush();
+		h.manager.stop();
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: "async-restart", mode: "single", state: "complete", startedAt: h.clock.now, endedAt: h.clock.now }), "utf-8");
+
+		const next = createScheduledRunManager({
+			config: { scheduledRuns: { enabled: true } },
+			storeRoot: path.join(h.root, "stores"),
+			now: () => h.clock.now,
+			randomId: () => "reconciled-id",
+			timers: new FakeTimers(),
+			launch: async () => ({ content: [{ type: "text", text: "unused" }], details: { mode: "management", results: [] } }),
+		});
+		const nextCtx = context(h.ctx.cwd, "session-b");
+		next.bindSession(nextCtx);
+		const history = await next.handleToolCall({ action: "schedule.history", id: "restart" }, nextCtx);
+		assert.match(text(history), /completed.*async async-restart/);
+	});
+
+	it("records elapsed overlap and catch-up-none slots without an immediate rerun", async () => {
+		const latest = harness();
+		await latest.manager.handleToolCall({ action: "schedule.create", id: "overlap", every: "1h", catchUp: "latest", agent: "worker" }, latest.ctx);
+		latest.clock.now += 3_600_000;
+		latest.timers.fireAll();
+		latest.launches[0]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "single", results: [], asyncId: "long-run" } });
+		await flush();
+		latest.clock.now += 3 * 3_600_000;
+		latest.timers.fireAll();
+		assert.equal(latest.launches.length, 1, "an overlapping occurrence is skipped instead of queued");
+		latest.manager.handleAsyncCompletion({ runId: "long-run", success: true });
+		const latestHistory = await latest.manager.handleToolCall({ action: "schedule.history", id: "overlap" }, latest.ctx);
+		assert.match(text(latestHistory), /skipped/);
+		assert.match(text(latestHistory), /completed.*async long-run/);
+		assert.match(text(await latest.manager.handleToolCall({ action: "schedule.show", id: "overlap" }, latest.ctx)), /2030-01-01T05:00:00.000Z/);
+
+		const none = harness();
+		await none.manager.handleToolCall({ action: "schedule.create", id: "none-overlap", every: "1h", catchUp: "none", agent: "worker" }, none.ctx);
+		none.clock.now += 3_600_000;
+		none.timers.fireAll();
+		none.launches[0]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "single", results: [], asyncId: "none-long-run" } });
+		await flush();
+		none.clock.now += 3 * 3_600_000;
+		none.timers.fireAll();
+		assert.equal(none.launches.length, 1);
+		none.manager.handleAsyncCompletion({ runId: "none-long-run", success: true });
+		assert.match(text(await none.manager.handleToolCall({ action: "schedule.history", id: "none-overlap" }, none.ctx)), /skipped/);
+		assert.match(text(await none.manager.handleToolCall({ action: "schedule.show", id: "none-overlap" }, none.ctx)), /2030-01-01T05:00:00.000Z/);
 	});
 
 	it("manual run uses the normal async target and overlap skip prevents a second launch", async () => {

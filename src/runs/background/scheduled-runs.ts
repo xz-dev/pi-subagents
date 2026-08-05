@@ -5,7 +5,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { writePrivateAtomicJson } from "../../shared/atomic-json.ts";
 import { shortenPath } from "../../shared/formatters.ts";
-import type { Details, ExtensionConfig } from "../../shared/types.ts";
+import type { AsyncStatus, Details, ExtensionConfig } from "../../shared/types.ts";
 import type { SubagentParamsLike } from "../foreground/subagent-executor.ts";
 import { validateExecutionAcceptance } from "../shared/acceptance.ts";
 import type { ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
@@ -46,7 +46,6 @@ export interface ScheduleRecord {
 	overlap: "skip";
 	catchUp: "none" | "latest";
 	timeoutMs?: number;
-	missionId?: string;
 	paused: boolean;
 	createdAt: string;
 	updatedAt: string;
@@ -65,7 +64,6 @@ export interface ScheduleRunRecord {
 	completedAt?: string;
 	asyncId?: string;
 	asyncDir?: string;
-	missionId?: string;
 	error?: string;
 }
 
@@ -142,8 +140,21 @@ function validateScheduleId(id: string): string {
 	return id;
 }
 
-function scheduleDir(root: string, id: string): string {
-	return path.join(root, validateScheduleId(id));
+function scheduleDir(root: string, id: string, create = false): string {
+	const dir = path.join(root, validateScheduleId(id));
+	fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+	try {
+		const stat = fs.lstatSync(dir);
+		if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`Schedule path '${dir}' must be a real directory.`);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		if (!create) return dir;
+		fs.mkdirSync(dir, { mode: 0o700 });
+	}
+	const rootPath = fs.realpathSync(root);
+	const dirPath = fs.realpathSync(dir);
+	if (dirPath !== path.join(rootPath, id)) throw new Error(`Schedule path '${dir}' escapes the project schedule root.`);
+	return dir;
 }
 
 function readJson(file: string, label: string): unknown {
@@ -193,7 +204,7 @@ class ScheduleStore {
 	}
 
 	write(record: ScheduleRecord): void {
-		writePrivateAtomicJson(path.join(scheduleDir(this.root, record.id), "schedule.json"), record);
+		writePrivateAtomicJson(path.join(scheduleDir(this.root, record.id, true), "schedule.json"), record);
 	}
 
 	delete(id: string): void {
@@ -209,7 +220,7 @@ class ScheduleStore {
 	}
 
 	writeRun(schedule: ScheduleRecord, run: ScheduleRunRecord, event: string): void {
-		const dir = scheduleDir(this.root, schedule.id);
+		const dir = scheduleDir(this.root, schedule.id, true);
 		writePrivateAtomicJson(path.join(dir, "runs", `${run.id}.json`), run);
 		const runs = [run, ...this.history(schedule.id).filter((item) => item.id !== run.id)].slice(0, MAX_HISTORY);
 		writePrivateAtomicJson(path.join(dir, "history.json"), { schemaVersion: 1, runs });
@@ -218,7 +229,7 @@ class ScheduleStore {
 	}
 
 	appendEvent(schedule: ScheduleRecord, event: string): void {
-		const dir = scheduleDir(this.root, schedule.id);
+		const dir = scheduleDir(this.root, schedule.id, true);
 		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 		fs.appendFileSync(path.join(dir, "events.jsonl"), `${JSON.stringify({ schemaVersion: 1, timestamp: new Date().toISOString(), event, scheduleId: schedule.id })}\n`, { encoding: "utf-8", mode: 0o600 });
 	}
@@ -282,8 +293,8 @@ function executionParams(schedule: ScheduleRecord): SubagentParamsLike {
 		clarify: false,
 		context: "fresh",
 		cwd: schedule.cwd,
+		mission: false,
 		...(schedule.timeoutMs === undefined ? {} : { timeoutMs: schedule.timeoutMs }),
-		...(schedule.missionId === undefined ? {} : { missionId: schedule.missionId }),
 	};
 }
 
@@ -293,6 +304,7 @@ export function listScheduledRunSummaries(cwd: string, root?: string): ScheduleR
 
 export class ScheduledRunManager {
 	private store?: ScheduleStore;
+	private readonly stores = new Map<string, ScheduleStore>();
 	private ctx?: ExtensionContext;
 	private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly now: () => number;
@@ -309,6 +321,7 @@ export class ScheduledRunManager {
 
 	bindSession(ctx: ExtensionContext): void {
 		this.stopTimers();
+		this.stores.clear();
 		this.store = undefined;
 		this.ctx = ctx;
 		if (!scheduledRunsEnabled(this.deps.config)) return;
@@ -319,6 +332,7 @@ export class ScheduledRunManager {
 		this.stopTimers();
 		this.ctx = undefined;
 		this.store = undefined;
+		this.stores.clear();
 	}
 
 	async handleToolCall(params: SubagentParamsLike, ctx: ExtensionContext): Promise<AgentToolResult<Details>> {
@@ -347,20 +361,14 @@ export class ScheduledRunManager {
 		if (!payload || typeof payload !== "object") return;
 		const data = payload as { id?: unknown; runId?: unknown; success?: unknown; state?: unknown; summary?: unknown };
 		const asyncId = typeof data.runId === "string" ? data.runId : typeof data.id === "string" ? data.id : undefined;
-		if (!asyncId || !this.store) return;
-		for (const schedule of this.store.list()) {
-			const run = this.store.history(schedule.id).find((item) => item.asyncId === asyncId && item.state === "running");
-			if (!run) continue;
-			run.state = data.success === true ? "completed" : "failed_run";
-			run.completedAt = timestamp(this.now());
-			if (run.state === "failed_run" && typeof data.summary === "string") run.error = data.summary;
-			schedule.activeRunId = undefined;
-			schedule.updatedAt = timestamp(this.now());
-			this.store.write(schedule);
-			fs.rmSync(path.join(scheduleDir(this.store.root, schedule.id), "active.lock"), { force: true });
-			this.store.writeRun(schedule, run, run.state === "completed" ? "schedule.run.completed" : "schedule.run.failed");
-			this.arm(schedule);
-			return;
+		if (!asyncId) return;
+		for (const store of this.stores.values()) {
+			for (const schedule of store.list()) {
+				const run = store.history(schedule.id).find((item) => item.asyncId === asyncId && item.state === "running");
+				if (!run) continue;
+				this.finishRun(store, schedule, run, data.success === true, typeof data.summary === "string" ? data.summary : undefined);
+				return;
+			}
 		}
 	}
 
@@ -373,6 +381,7 @@ export class ScheduledRunManager {
 		if (Boolean(at) === Boolean(every)) return textResult("schedule.create requires exactly one trigger: at or every.", undefined, undefined, true);
 		if (params.overlap !== undefined && params.overlap !== "skip") return textResult("This first recurring slice supports overlap='skip' only.", undefined, undefined, true);
 		if (params.catchUp !== undefined && params.catchUp !== "none" && params.catchUp !== "latest") return textResult("catchUp must be 'none' or 'latest'.", undefined, undefined, true);
+		if (params.missionId !== undefined || params.mission !== undefined || params.missionUpdate !== undefined || params.missionStatus !== undefined || params.missionScope !== undefined) return textResult("Mission attachment is deferred from this first schedule slice.", undefined, undefined, true);
 		if (params.on !== undefined || params.timezone !== undefined || every === "day" || every === "week" || every === "month" || every === "year") return textResult("Calendar schedules are deferred from this first safe slice. Use a fixed interval such as every:'24h' or every:'7d'.", undefined, undefined, true);
 		const sessionId = ctx.sessionManager.getSessionId() ?? "unknown";
 		if (this.deps.resolveCapabilityCeiling?.(sessionId)) return textResult("Cannot persist a schedule while a capability ceiling is active.", undefined, undefined, true);
@@ -398,14 +407,13 @@ export class ScheduledRunManager {
 			overlap: "skip",
 			catchUp: params.catchUp ?? "latest",
 			...(params.timeoutMs === undefined ? {} : { timeoutMs: params.timeoutMs }),
-			...(params.missionId === undefined ? {} : { missionId: params.missionId }),
 			paused: false,
 			createdAt: timestamp(now),
 			updatedAt: timestamp(now),
 		};
 		store.write(schedule);
 		store.appendEvent(schedule, "schedule.created");
-		this.arm(schedule);
+		this.arm(schedule, store);
 		return textResult(`Created schedule ${id}.\nName: ${schedule.name}\nTrigger: ${at ? `at ${at}` : `every ${every}`}\nNext: ${schedule.trigger.nextRunAt}\nTarget: ${targetLabel(schedule.target)}`, [schedule]);
 	}
 
@@ -433,89 +441,98 @@ export class ScheduledRunManager {
 		schedule.updatedAt = timestamp(this.now());
 		this.requireStore().write(schedule);
 		this.requireStore().appendEvent(schedule, paused ? "schedule.paused" : "schedule.resumed");
-		if (paused) this.clearTimer(schedule.id); else this.restoreOne(schedule);
+		const store = this.requireStore();
+		if (paused) this.clearTimer(store, schedule.id); else this.restoreOne(store, schedule);
 		return textResult(`${paused ? "Paused" : "Resumed"} schedule ${schedule.id}.`, [schedule]);
 	}
 
 	private async runManual(params: SubagentParamsLike): Promise<AgentToolResult<Details>> {
+		const store = this.requireStore();
 		const schedule = this.resolve(params);
-		const run = await this.launch(schedule, this.now(), "manual", false);
-		return textResult(`Manual schedule run ${run.id}: ${run.state}${run.asyncId ? ` (async ${run.asyncId})` : ""}.`, [this.requireStore().get(schedule.id)], [run], run.state === "failed_launch");
+		const run = await this.launch(store, schedule, this.now(), "manual", false);
+		return textResult(`Manual schedule run ${run.id}: ${run.state}${run.asyncId ? ` (async ${run.asyncId})` : ""}.`, [store.get(schedule.id)], [run], run.state === "failed_launch");
 	}
 
 	private async runDue(): Promise<AgentToolResult<Details>> {
-		const due = this.requireStore().list().filter((schedule) => !schedule.paused && nextRunAt(schedule) !== undefined && nextRunAt(schedule)! <= this.now());
+		const store = this.requireStore();
+		const due = store.list().filter((schedule) => !schedule.paused && nextRunAt(schedule) !== undefined && nextRunAt(schedule)! <= this.now());
 		const runs: ScheduleRunRecord[] = [];
-		for (const schedule of due) runs.push(await this.launch(schedule, duePlannedAt(schedule, this.now())!, "run-due", true));
-		return textResult(runs.length ? `Ran ${runs.length} due schedule(s).` : "No schedules are due.", this.requireStore().list(), runs);
+		for (const schedule of due) {
+			const planned = duePlannedAt(schedule, this.now())!;
+			if (!schedule.activeRunId && schedule.catchUp === "none" && planned < this.now()) runs.push(this.recordMissed(store, schedule, planned, "run-due"));
+			else runs.push(await this.launch(store, schedule, planned, "run-due", true));
+		}
+		return textResult(runs.length ? `Processed ${runs.length} due schedule(s).` : "No schedules are due.", store.list(), runs);
 	}
 
 	private remove(params: SubagentParamsLike): AgentToolResult<Details> {
 		const schedule = this.resolve(params);
 		if (schedule.activeRunId) return textResult(`Schedule ${schedule.id} has active run ${schedule.activeRunId}; stop that run before deleting the schedule.`, [schedule], undefined, true);
-		this.clearTimer(schedule.id);
-		this.requireStore().appendEvent(schedule, "schedule.deleted");
-		this.requireStore().delete(schedule.id);
+		const store = this.requireStore();
+		this.clearTimer(store, schedule.id);
+		store.appendEvent(schedule, "schedule.deleted");
+		store.delete(schedule.id);
 		return textResult(`Deleted schedule ${schedule.id}.`);
 	}
 
-	private restore(): void {
-		for (const schedule of this.requireStore().list()) this.restoreOne(schedule);
+	private restore(store: ScheduleStore): void {
+		for (const schedule of store.list()) this.restoreOne(store, schedule);
 	}
 
-	private restoreOne(schedule: ScheduleRecord): void {
+	private restoreOne(store: ScheduleStore, schedule: ScheduleRecord): void {
 		if (schedule.activeRunId) {
-			const run = this.requireStore().history(schedule.id).find((item) => item.id === schedule.activeRunId);
+			const run = store.history(schedule.id).find((item) => item.id === schedule.activeRunId);
 			const startedAt = run?.startedAt ? Date.parse(run.startedAt) : Number.NaN;
-			if (!run || run.state !== "running" || (!run.asyncId && Number.isFinite(startedAt) && startedAt + STALE_LAUNCH_CLAIM_MS <= this.now())) {
+			if (run?.state === "running" && run.asyncDir) {
+				try {
+					const status = readJson(path.join(run.asyncDir, "status.json"), "async status") as Partial<AsyncStatus>;
+					if (["complete", "failed", "stopped", "rejected"].includes(String(status.state))) this.finishRun(store, schedule, run, status.state === "complete", typeof status.error === "string" ? status.error : undefined);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof Error && /ENOENT/.test(error.message))) throw error;
+				}
+			}
+			if (schedule.activeRunId && (!run || run.state !== "running" || (!run.asyncId && Number.isFinite(startedAt) && startedAt + STALE_LAUNCH_CLAIM_MS <= this.now()))) {
 				if (run?.state === "running") {
 					run.state = "failed_launch";
 					run.completedAt = timestamp(this.now());
 					run.error = "Recovered a stale launch claim before an async run was attached.";
-					this.requireStore().writeRun(schedule, run, "schedule.run.failed");
+					store.writeRun(schedule, run, "schedule.run.failed");
 				}
 				schedule.activeRunId = undefined;
 				schedule.updatedAt = timestamp(this.now());
-				this.requireStore().write(schedule);
-				fs.rmSync(path.join(scheduleDir(this.requireStore().root, schedule.id), "active.lock"), { force: true });
+				store.write(schedule);
+				fs.rmSync(path.join(scheduleDir(store.root, schedule.id), "active.lock"), { force: true });
 			}
 		}
-		if (schedule.paused || schedule.activeRunId) return;
+		if (schedule.paused) return;
 		const next = nextRunAt(schedule);
 		if (next === undefined) return;
-		if (next < this.now() && schedule.catchUp === "none") {
-			const run: ScheduleRunRecord = { schemaVersion: 1, id: this.randomId(), scheduleId: schedule.id, plannedAt: timestamp(next), dueReason: "timer", state: "missed", completedAt: timestamp(this.now()) };
-			schedule.trigger.nextRunAt = nextAfter(schedule.trigger, next, this.now());
-			schedule.updatedAt = timestamp(this.now());
-			this.requireStore().write(schedule);
-			this.requireStore().writeRun(schedule, run, "schedule.missed");
-		}
-		this.arm(schedule);
+		if (!schedule.activeRunId && next < this.now() && schedule.catchUp === "none") this.recordMissed(store, schedule, next, "timer");
+		this.arm(schedule, store);
 	}
 
-	private arm(schedule: ScheduleRecord): void {
-		this.clearTimer(schedule.id);
-		if (schedule.paused || schedule.activeRunId) return;
+	private arm(schedule: ScheduleRecord, store: ScheduleStore): void {
+		this.clearTimer(store, schedule.id);
+		if (schedule.paused) return;
 		const next = nextRunAt(schedule);
 		if (next === undefined) return;
-		const timer = this.timersApi.setTimeout(() => void this.fire(schedule.id), Math.min(Math.max(0, next - this.now()), MAX_TIMER_DELAY_MS));
+		const timer = this.timersApi.setTimeout(() => void this.fire(store, schedule.id), Math.min(Math.max(0, next - this.now()), MAX_TIMER_DELAY_MS));
 		timer.unref?.();
-		this.timers.set(schedule.id, timer);
+		this.timers.set(this.timerKey(store, schedule.id), timer);
 	}
 
-	private async fire(id: string): Promise<void> {
-		this.clearTimer(id);
-		const schedule = this.requireStore().get(id);
+	private async fire(store: ScheduleStore, id: string): Promise<void> {
+		this.clearTimer(store, id);
+		const schedule = store.get(id);
 		const planned = duePlannedAt(schedule, this.now());
-		if (planned === undefined || schedule.paused || schedule.activeRunId) return;
-		if (planned > this.now()) return this.arm(schedule);
-		await this.launch(schedule, planned, "timer", true);
+		if (planned === undefined || schedule.paused) return;
+		if (planned > this.now()) return this.arm(schedule, store);
+		await this.launch(store, schedule, planned, "timer", true);
 	}
 
-	private async launch(schedule: ScheduleRecord, planned: number, dueReason: ScheduleRunRecord["dueReason"], advance: boolean): Promise<ScheduleRunRecord> {
-		const store = this.requireStore();
+	private async launch(store: ScheduleStore, schedule: ScheduleRecord, planned: number, dueReason: ScheduleRunRecord["dueReason"], advance: boolean): Promise<ScheduleRunRecord> {
 		const now = this.now();
-		const run: ScheduleRunRecord = { schemaVersion: 1, id: this.randomId(), scheduleId: schedule.id, plannedAt: timestamp(planned), dueReason, state: "running", startedAt: timestamp(now), ...(schedule.missionId ? { missionId: schedule.missionId } : {}) };
+		const run: ScheduleRunRecord = { schemaVersion: 1, id: this.randomId(), scheduleId: schedule.id, plannedAt: timestamp(planned), dueReason, state: "running", startedAt: timestamp(now) };
 		if (schedule.activeRunId) {
 			run.state = "skipped";
 			run.completedAt = timestamp(now);
@@ -525,6 +542,7 @@ export class ScheduledRunManager {
 				store.write(schedule);
 			}
 			store.writeRun(schedule, run, "schedule.skipped_overlap");
+			this.arm(schedule, store);
 			return run;
 		}
 		const lockPath = path.join(scheduleDir(store.root, schedule.id), "active.lock");
@@ -544,6 +562,7 @@ export class ScheduledRunManager {
 				store.write(schedule);
 			}
 			store.writeRun(schedule, run, "schedule.skipped_overlap");
+			this.arm(schedule, store);
 			return run;
 		}
 		schedule.activeRunId = run.id;
@@ -559,7 +578,7 @@ export class ScheduledRunManager {
 			run.asyncId = asyncId;
 			run.asyncDir = result.details?.asyncDir;
 			store.writeRun(schedule, run, "schedule.run.attached_async");
-			this.arm(schedule);
+			this.arm(schedule, store);
 			return run;
 		} catch (error) {
 			run.state = "failed_launch";
@@ -570,17 +589,65 @@ export class ScheduledRunManager {
 			store.write(schedule);
 			store.writeRun(schedule, run, "schedule.run.failed");
 			fs.rmSync(lockPath, { force: true });
-			this.arm(schedule);
+			this.arm(schedule, store);
 			return run;
 		}
 	}
 
+	private finishRun(store: ScheduleStore, schedule: ScheduleRecord, run: ScheduleRunRecord, success: boolean, error?: string): void {
+		const now = this.now();
+		const next = nextRunAt(schedule);
+		if (next !== undefined && next <= now) {
+			const planned = duePlannedAt(schedule, now)!;
+			const skipped: ScheduleRunRecord = {
+				schemaVersion: 1,
+				id: this.randomId(),
+				scheduleId: schedule.id,
+				plannedAt: timestamp(planned),
+				dueReason: "timer",
+				state: "skipped",
+				completedAt: timestamp(now),
+			};
+			schedule.trigger.nextRunAt = nextAfter(schedule.trigger, planned, now);
+			store.writeRun(schedule, skipped, "schedule.skipped_overlap");
+		}
+		run.state = success ? "completed" : "failed_run";
+		run.completedAt = timestamp(now);
+		if (!success && error) run.error = error;
+		schedule.activeRunId = undefined;
+		schedule.updatedAt = timestamp(now);
+		store.write(schedule);
+		fs.rmSync(path.join(scheduleDir(store.root, schedule.id), "active.lock"), { force: true });
+		store.writeRun(schedule, run, success ? "schedule.run.completed" : "schedule.run.failed");
+		this.arm(schedule, store);
+	}
+
+	private recordMissed(store: ScheduleStore, schedule: ScheduleRecord, planned: number, dueReason: ScheduleRunRecord["dueReason"]): ScheduleRunRecord {
+		const run: ScheduleRunRecord = {
+			schemaVersion: 1,
+			id: this.randomId(),
+			scheduleId: schedule.id,
+			plannedAt: timestamp(planned),
+			dueReason,
+			state: "missed",
+			completedAt: timestamp(this.now()),
+		};
+		schedule.trigger.nextRunAt = nextAfter(schedule.trigger, planned, this.now());
+		schedule.updatedAt = timestamp(this.now());
+		store.write(schedule);
+		store.writeRun(schedule, run, "schedule.missed");
+		return run;
+	}
+
 	private selectProject(cwd: string): void {
 		const root = scheduledRunStorePath(cwd, undefined, this.deps.storeRoot);
-		if (this.store?.root === root) return;
-		this.stopTimers();
-		this.store = new ScheduleStore(root);
-		this.restore();
+		let store = this.stores.get(root);
+		if (!store) {
+			store = new ScheduleStore(root);
+			this.stores.set(root, store);
+			this.restore(store);
+		}
+		this.store = store;
 	}
 
 	private resolve(params: SubagentParamsLike): ScheduleRecord {
@@ -599,11 +666,16 @@ export class ScheduledRunManager {
 		return this.ctx;
 	}
 
-	private clearTimer(id: string): void {
-		const timer = this.timers.get(id);
+	private timerKey(store: ScheduleStore, id: string): string {
+		return `${store.root}\0${id}`;
+	}
+
+	private clearTimer(store: ScheduleStore, id: string): void {
+		const key = this.timerKey(store, id);
+		const timer = this.timers.get(key);
 		if (!timer) return;
 		this.timersApi.clearTimeout(timer);
-		this.timers.delete(id);
+		this.timers.delete(key);
 	}
 
 	private stopTimers(): void {
