@@ -305,7 +305,7 @@ export function listScheduledRunSummaries(cwd: string, root?: string): ScheduleR
 export class ScheduledRunManager {
 	private store?: ScheduleStore;
 	private readonly stores = new Map<string, ScheduleStore>();
-	private ctx?: ExtensionContext;
+	private readonly contexts = new Map<string, ExtensionContext>();
 	private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly now: () => number;
 	private readonly randomId: () => string;
@@ -322,24 +322,23 @@ export class ScheduledRunManager {
 	bindSession(ctx: ExtensionContext): void {
 		this.stopTimers();
 		this.stores.clear();
+		this.contexts.clear();
 		this.store = undefined;
-		this.ctx = ctx;
 		if (!scheduledRunsEnabled(this.deps.config)) return;
-		this.selectProject(ctx.cwd);
+		this.selectProject(ctx.cwd, ctx);
 	}
 
 	stop(): void {
 		this.stopTimers();
-		this.ctx = undefined;
 		this.store = undefined;
 		this.stores.clear();
+		this.contexts.clear();
 	}
 
 	async handleToolCall(params: SubagentParamsLike, ctx: ExtensionContext): Promise<AgentToolResult<Details>> {
-		this.ctx = ctx;
 		try {
 			if (!scheduledRunsEnabled(this.deps.config)) return textResult("Scheduled runs are disabled by scheduledRuns.enabled=false.", undefined, undefined, true);
-			this.selectProject(params.cwd ?? ctx.cwd);
+			this.selectProject(params.cwd ?? ctx.cwd, ctx);
 			switch (params.action) {
 				case "schedule.create": return this.create(params, ctx);
 				case "schedule.list": return this.list();
@@ -572,7 +571,7 @@ export class ScheduledRunManager {
 		store.write(schedule);
 		store.writeRun(schedule, run, "schedule.run.started");
 		try {
-			const result = await this.deps.launch(executionParams(schedule), this.requireContext(), new AbortController().signal);
+			const result = await this.deps.launch(executionParams(schedule), this.requireContext(store), new AbortController().signal);
 			const asyncId = result.details?.asyncId ?? result.details?.runId;
 			if (result.isError || !asyncId) throw new Error(result.content.find((item) => item.type === "text")?.text ?? "Scheduled launch failed.");
 			run.asyncId = asyncId;
@@ -639,8 +638,9 @@ export class ScheduledRunManager {
 		return run;
 	}
 
-	private selectProject(cwd: string): void {
+	private selectProject(cwd: string, ctx: ExtensionContext): void {
 		const root = scheduledRunStorePath(cwd, undefined, this.deps.storeRoot);
+		this.contexts.set(root, ctx);
 		let store = this.stores.get(root);
 		if (!store) {
 			store = new ScheduleStore(root);
@@ -661,9 +661,10 @@ export class ScheduledRunManager {
 		return this.store;
 	}
 
-	private requireContext(): ExtensionContext {
-		if (!this.ctx) throw new Error("Schedule runtime context is unavailable.");
-		return this.ctx;
+	private requireContext(store: ScheduleStore): ExtensionContext {
+		const ctx = this.contexts.get(store.root);
+		if (!ctx) throw new Error("Schedule runtime context is unavailable.");
+		return ctx;
 	}
 
 	private timerKey(store: ScheduleStore, id: string): string {

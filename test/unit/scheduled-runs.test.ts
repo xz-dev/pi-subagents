@@ -38,6 +38,7 @@ class FakeTimers {
 
 type Launch = {
 	params: Record<string, unknown>;
+	ctx: ExtensionContext;
 	resolve(result: { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown>; isError?: boolean }): void;
 };
 
@@ -81,7 +82,7 @@ function harness(options: { cwd?: string; sessionId?: string; now?: number; conf
 		now: () => clock.now,
 		randomId: () => `id-${++id}`,
 		timers,
-		launch: (params) => new Promise((resolve) => launches.push({ params: params as Record<string, unknown>, resolve: resolve as Launch["resolve"] })) as never,
+		launch: (params, launchCtx) => new Promise((resolve) => launches.push({ params: params as Record<string, unknown>, ctx: launchCtx, resolve: resolve as Launch["resolve"] })) as never,
 	});
 	manager.bindSession(ctx);
 	return { manager, ctx, clock, timers, launches, root };
@@ -268,18 +269,27 @@ describe("recurring schedule execution", () => {
 		assert.equal(none.launches.length, 0);
 	});
 
-	it("keeps project timers and completion ownership when another project is selected", async () => {
+	it("keeps project timers, contexts, and completion ownership when another project is selected", async () => {
 		const h = harness();
 		await h.manager.handleToolCall({ action: "schedule.create", id: "project-a", every: "1h", agent: "worker" }, h.ctx);
-		h.clock.now += 3_600_000;
-		h.timers.fireAll();
-		h.launches[0]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "single", results: [], asyncId: "async-a" } });
-		await flush();
 
 		const projectB = path.join(h.root, "project-b");
 		fs.mkdirSync(projectB);
-		await h.manager.handleToolCall({ action: "schedule.create", id: "project-b", cwd: projectB, every: "1h", agent: "worker" }, h.ctx);
+		const projectBCtx = context(projectB, "session-b");
+		await h.manager.handleToolCall({ action: "schedule.create", id: "project-b", every: "1h", agent: "worker" }, projectBCtx);
 		assert.equal(h.timers.values.size, 2, "both project timers remain armed");
+
+		h.clock.now += 3_600_000;
+		h.timers.fireAll();
+		await flush();
+		assert.equal(h.launches.length, 2);
+		assert.equal(h.launches[0]!.ctx.cwd, h.ctx.cwd);
+		assert.equal(h.launches[0]!.ctx.sessionManager.getSessionId(), "session-a");
+		assert.equal(h.launches[1]!.ctx.cwd, projectB);
+		assert.equal(h.launches[1]!.ctx.sessionManager.getSessionId(), "session-b");
+		h.launches[0]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "single", results: [], asyncId: "async-a" } });
+		h.launches[1]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "single", results: [], asyncId: "async-b" } });
+		await flush();
 
 		h.manager.handleAsyncCompletion({ runId: "async-a", success: true });
 		const history = await h.manager.handleToolCall({ action: "schedule.history", id: "project-a" }, h.ctx);
