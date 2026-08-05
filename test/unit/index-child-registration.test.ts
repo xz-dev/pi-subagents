@@ -90,22 +90,26 @@ describe("subagent extension child mode", () => {
 			}, theme).text;
 			const foregroundWorkflow = registeredTool.renderCall({ workflowScript: "return runs.run('publish', {agent:'worker'});", async: false }, theme).text;
 			const clarifiedWorkflow = registeredTool.renderCall({ workflowScript: "return runs.run('clarify', {agent:'worker'});", async: true, clarify: true }, theme).text;
+			const templateWorkflow = registeredTool.renderCall({ workflowScript: "return runs.run(\`template\`, {agent:'worker'});", async: false }, theme).text;
+			const commentedWorkflow = registeredTool.renderCall({ workflowScript: "// runs.run('ignored', {agent:'worker'})\nconst note = \"key: 'also-ignored'\"; return runs.run('real', {agent:'worker'});" }, theme).text;
 			const dynamicKeyWorkflow = registeredTool.renderCall({ workflowScript: "return runs.all([{key: 'review-' + item, agent: 'reviewer'}]);" }, theme).text;
 			if (!single.includes("worker [async]")) throw new Error("expected async single badge, got " + single);
 			if (!workflow.includes("background · 3 lanes: scan, correctness, tests")) throw new Error("expected workflow manifest, got " + workflow);
 			if (!foregroundWorkflow.includes("foreground · 1 lane: publish")) throw new Error("expected foreground workflow manifest, got " + foregroundWorkflow);
-			if (!clarifiedWorkflow.includes("foreground · 1 lane: clarify")) throw new Error("expected clarified foreground workflow, got " + clarifiedWorkflow);
+			if (!clarifiedWorkflow.includes("background · 1 lane: clarify")) throw new Error("expected workflow executor mode despite clarify, got " + clarifiedWorkflow);
+			if (!templateWorkflow.includes("foreground · 1 lane: template")) throw new Error("expected static template lane, got " + templateWorkflow);
+			if (!commentedWorkflow.includes("background · 1 lane: real")) throw new Error("expected lexical lane filtering, got " + commentedWorkflow);
 			if (!dynamicKeyWorkflow.includes("workflow script · background")) throw new Error("expected dynamic key fallback, got " + dynamicKeyWorkflow);
 		`;
 		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
 	});
 
-	it("uses the configured async default and comment-aware literal lane keys in workflow manifests", () => {
+	it("shows omitted workflow async as background even when asyncByDefault is false", () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-workflow-manifest-config-"));
 		try {
 			const configDir = path.join(agentDir, "extensions", "subagent");
 			fs.mkdirSync(configDir, { recursive: true });
-			fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ asyncByDefault: false }), "utf-8");
+			fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ asyncByDefault: false, forceTopLevelAsync: true }), "utf-8");
 			const script = String.raw`
 				import registerSubagentExtension from "./index.ts";
 				const events = { on() { return () => {}; }, emit() {} };
@@ -119,7 +123,12 @@ describe("subagent extension child mode", () => {
 				const result = registeredTool.renderCall({
 					workflowScript: "return runs.run('scan' /* stable lane */, {agent:'worker'});",
 				}, theme).text;
-				if (!result.includes("foreground · 1 lane: scan")) throw new Error("expected configured foreground manifest, got " + result);
+				const explicitForeground = registeredTool.renderCall({
+					workflowScript: "return runs.run('publish', {agent:'worker'});",
+					async: false,
+				}, theme).text;
+				if (!result.includes("background · 1 lane: scan")) throw new Error("expected workflow executor background manifest, got " + result);
+				if (!explicitForeground.includes("foreground · 1 lane: publish")) throw new Error("expected workflow executor foreground manifest, got " + explicitForeground);
 			`;
 			const env = parentToolEnv();
 			env.PI_CODING_AGENT_DIR = agentDir;

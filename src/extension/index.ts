@@ -85,16 +85,75 @@ function workflowLaneKeys(script: string): string[] {
 			keys.push(key);
 		}
 	};
-	const commentsOrWhitespace = String.raw`(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*)*`;
-	const literal = String.raw`(["'])([^"'\r\n]+)\1`;
-	for (const match of script.matchAll(new RegExp(String.raw`\bruns\.run\s*\(\s*${literal}(?=${commentsOrWhitespace}(?:,|\)))`, "g"))) add(match[2]!);
-	for (const match of script.matchAll(new RegExp(String.raw`\bkey\s*:\s*${literal}(?=${commentsOrWhitespace}(?:,|\}))`, "g"))) add(match[2]!);
+	const isIdentifier = (char: string | undefined): boolean => char !== undefined && /[\w$]/.test(char);
+	const skipTrivia = (start: number): number => {
+		let index = start;
+		while (index < script.length) {
+			if (/\s/.test(script[index]!)) index += 1;
+			else if (script.startsWith("//", index)) {
+				const end = script.indexOf("\n", index + 2);
+				index = end === -1 ? script.length : end + 1;
+			} else if (script.startsWith("/*", index)) {
+				const end = script.indexOf("*/", index + 2);
+				index = end === -1 ? script.length : end + 2;
+			} else break;
+		}
+		return index;
+	};
+	const readLiteral = (start: number): { key?: string; end: number } | undefined => {
+		const quote = script[start];
+		if (quote !== "'" && quote !== '"' && quote !== "`") return undefined;
+		let index = start + 1;
+		let dynamicTemplate = false;
+		while (index < script.length) {
+			if (script[index] === "\\") {
+				index += 2;
+				continue;
+			}
+			if (quote === "`" && script.startsWith("${", index)) dynamicTemplate = true;
+			if (script[index] === quote) return { key: dynamicTemplate ? undefined : script.slice(start + 1, index), end: index + 1 };
+			if (quote !== "`" && /[\r\n]/.test(script[index]!)) return { end: index + 1 };
+			index += 1;
+		}
+		return { end: script.length };
+	};
+
+	for (let index = 0; index < script.length;) {
+		index = skipTrivia(index);
+		const literal = readLiteral(index);
+		if (literal) {
+			index = literal.end;
+			continue;
+		}
+		if (!isIdentifier(script[index - 1]) && script.startsWith("runs.run", index) && !isIdentifier(script[index + 8])) {
+			const open = skipTrivia(index + 8);
+			const key = script[open] === "(" ? readLiteral(skipTrivia(open + 1)) : undefined;
+			if (key) {
+				const next = skipTrivia(key.end);
+				if (key.key !== undefined && (script[next] === "," || script[next] === ")")) add(key.key);
+				index = key.end;
+				continue;
+			}
+		}
+		if (!isIdentifier(script[index - 1]) && script.startsWith("key", index) && !isIdentifier(script[index + 3])) {
+			const colon = skipTrivia(index + 3);
+			const key = script[colon] === ":" ? readLiteral(skipTrivia(colon + 1)) : undefined;
+			if (key) {
+				const next = skipTrivia(key.end);
+				if (key.key !== undefined && (script[next] === "," || script[next] === "}")) add(key.key);
+				index = key.end;
+				continue;
+			}
+		}
+		index += 1;
+	}
 	return keys;
 }
 
-function formatWorkflowManifest(script: string, async: unknown, asyncByDefault: boolean, clarify: unknown): string {
+function formatWorkflowManifest(script: string, async: unknown): string {
 	const keys = workflowLaneKeys(script);
-	const mode = clarify === true || (async ?? asyncByDefault) !== true ? "foreground" : "background";
+	// The workflow executor starts background work unless callers pass async:false.
+	const mode = async === false ? "foreground" : "background";
 	if (keys.length === 0) return `workflow script · ${mode}`;
 	const visibleKeys = keys.slice(0, 4).join(", ");
 	const remainder = keys.length > 4 ? `, +${keys.length - 4}` : "";
@@ -444,7 +503,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			}
 			if (args.workflowScript)
 				return new Text(
-					`${theme.fg("toolTitle", theme.bold("subagent "))}${formatWorkflowManifest(args.workflowScript, args.async, asyncByDefault, args.clarify)}`,
+					`${theme.fg("toolTitle", theme.bold("subagent "))}${formatWorkflowManifest(args.workflowScript, args.async)}`,
 					0,
 					0,
 				);
