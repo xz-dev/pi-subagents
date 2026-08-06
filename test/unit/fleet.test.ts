@@ -595,8 +595,8 @@ describe("native subagent fleet", () => {
 				hasUI: true,
 				ui: {
 					setWidget() {},
-					async custom(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: undefined) => void) => SubagentFleetComponent) {
-						const component = factory({ terminal: { rows: 32 }, requestRender() {} }, theme, undefined, () => {});
+					async custom(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: undefined) => void) => Promise<SubagentFleetComponent>) {
+						const component = await factory({ terminal: { rows: 32 }, requestRender() {} }, theme, undefined, () => {});
 						try {
 							rendered = component.render(100).join("\n");
 						} finally {
@@ -613,28 +613,39 @@ describe("native subagent fleet", () => {
 		}
 	});
 
-	it("suppresses the status widget for the full inspector lifecycle", async () => {
+	it("reclaims widget rows before creating the inspector", async () => {
 		const state = stateForTest();
-		let hidden = 0;
-		let observedOpen = false;
+		const events: string[] = [];
+		let layoutCommitted = false;
 		const ctx = {
 			hasUI: true,
 			ui: {
 				setWidget(key: string, content: unknown) {
 					assert.equal(key, FLEET_STATUS_WIDGET_KEY);
 					assert.equal(content, undefined);
-					hidden++;
+					events.push("hidden");
 				},
-				async custom() {
-					observedOpen = state.fleetInspectorOpen === true;
+				async custom(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: () => void) => Promise<unknown>) {
+					const component = await factory({
+						requestRender(force?: boolean) {
+							assert.equal(force, true);
+							events.push("requested");
+							process.nextTick(() => {
+								layoutCommitted = true;
+								events.push("committed");
+							});
+						},
+					}, theme, undefined, () => {});
+					assert.equal(layoutCommitted, true);
+					events.push("shown");
+					assert.ok(component);
 					throw new Error("overlay closed");
 				},
 			},
 		};
 
 		await assert.rejects(openSubagentFleet(ctx as never, state), /overlay closed/);
-		assert.equal(hidden, 1);
-		assert.equal(observedOpen, true);
+		assert.deepEqual(events, ["hidden", "requested", "committed", "shown"]);
 		assert.equal(state.fleetInspectorOpen, false);
 	});
 

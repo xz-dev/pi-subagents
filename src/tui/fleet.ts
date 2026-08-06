@@ -24,7 +24,7 @@ const TRANSCRIPT_LINES = 200;
 type Theme = ExtensionContext["ui"]["theme"];
 type FleetTui = {
 	terminal?: { rows: number };
-	requestRender(): void;
+	requestRender(force?: boolean): void;
 };
 type AsyncStep = AsyncRunSummary["steps"][number];
 
@@ -857,7 +857,13 @@ export async function openSubagentFleet(ctx: ExtensionContext, state: SubagentSt
 	} satisfies FleetActionHandlers;
 	try {
 		await ctx.ui.custom<undefined>(
-			(tui, theme, _keybindings, done) => new SubagentFleetComponent(tui, theme, state, done, { ...options, actions }),
+			async (tui, theme, _keybindings, done) => {
+				// requestRender(true) schedules Pi's layout on nextTick. Queue ours after it so
+				// the widget-free viewport is committed before the inspector is constructed.
+				(tui as FleetTui).requestRender(true);
+				await new Promise<void>((resolve) => process.nextTick(resolve));
+				return new SubagentFleetComponent(tui, theme, state, done, { ...options, actions });
+			},
 			{
 				overlay: true,
 				overlayOptions: { anchor: "center", width: "95%", minWidth: 60, maxHeight: "85%", margin: 1 },
